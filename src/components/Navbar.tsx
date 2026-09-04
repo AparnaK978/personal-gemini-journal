@@ -1,13 +1,20 @@
 import React from 'react';
-import { BookOpen, Shield, LogOut, User as UserIcon } from 'lucide-react';
+import { BookOpen, Shield, LogOut, User as UserIcon, Sparkles } from 'lucide-react';
 import { AppUser } from '../types';
 
 interface NavbarProps {
   user: AppUser | null;
+  currentView: 'journal' | 'insights';
+  onViewChange: (view: 'journal' | 'insights') => void;
   onSignOut: () => void;
 }
 
-export const Navbar: React.FC<NavbarProps> = ({ user, onSignOut }) => {
+export const Navbar: React.FC<NavbarProps> = ({
+  user,
+  currentView,
+  onViewChange,
+  onSignOut
+}) => {
   return (
     <header className="border-b border-stone-200 bg-stone-50/80 backdrop-blur-md sticky top-0 z-30">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
@@ -29,6 +36,34 @@ export const Navbar: React.FC<NavbarProps> = ({ user, onSignOut }) => {
             </p>
           </div>
         </div>
+
+        {/* Center Nav tabs when authenticated */}
+        {user && (
+          <div className="flex items-center p-1 bg-stone-200/60 rounded-xl border border-stone-200/70">
+            <button
+              onClick={() => onViewChange('journal')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
+                currentView === 'journal'
+                  ? 'bg-white text-stone-900 shadow-2xs'
+                  : 'text-stone-600 hover:text-stone-900'
+              }`}
+            >
+              <BookOpen className="w-3.5 h-3.5" />
+              <span>Journal</span>
+            </button>
+            <button
+              onClick={() => onViewChange('insights')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
+                currentView === 'insights'
+                  ? 'bg-white text-stone-900 shadow-2xs'
+                  : 'text-stone-600 hover:text-stone-900'
+              }`}
+            >
+              <Sparkles className={`w-3.5 h-3.5 ${currentView === 'insights' ? 'text-amber-600' : 'text-stone-500'}`} />
+              <span>Insights</span>
+            </button>
+          </div>
+        )}
 
         {user && (
           <div className="flex items-center space-x-3">
@@ -57,7 +92,7 @@ export const Navbar: React.FC<NavbarProps> = ({ user, onSignOut }) => {
 
             <button
               onClick={onSignOut}
-              className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-stone-600 hover:text-stone-900 hover:bg-stone-200/60 rounded-xl transition-colors"
+              className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-stone-600 hover:text-stone-900 hover:bg-stone-200/60 rounded-xl transition-colors cursor-pointer"
               title="Sign Out"
             >
               <LogOut className="w-4 h-4" />
@@ -69,3 +104,4 @@ export const Navbar: React.FC<NavbarProps> = ({ user, onSignOut }) => {
     </header>
   );
 };
+

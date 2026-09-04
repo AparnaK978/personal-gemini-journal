@@ -43,6 +43,16 @@ service cloud.firestore {
           allow delete: if isOwner(userId);
         }
       }
+
+      // AI Mood & Progress Insights subcollection
+      match /insights/{insightId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId)
+                      && request.resource.data.userId == userId;
+        allow update: if isOwner(userId)
+                      && request.resource.data.userId == resource.data.userId;
+        allow delete: if isOwner(userId);
+      }
     }
   }
 }

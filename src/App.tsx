@@ -1,10 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { onAuthStateChanged } from 'firebase/auth';
 import { auth, signInWithGoogle, signOutUser } from './lib/firebase';
-import { AppUser, JournalEntry, JournalMessage } from './types';
+import { AppUser, JournalEntry, JournalMessage, UserInsight } from './types';
 import {
   subscribeToEntries,
   subscribeToMessages,
+  subscribeToInsights,
+  saveUserInsight,
   createJournalEntry,
   updateJournalEntry,
   deleteJournalEntry,
@@ -14,13 +16,18 @@ import {
   deleteJournalMessage,
   clearJournalMessages
 } from './services/journalService';
-import { askGemini, generateJournalSummary } from './services/aiService';
+import {
+  askGemini,
+  generateJournalSummary,
+  generateMoodAndProgressInsights
+} from './services/aiService';
 import { Navbar } from './components/Navbar';
 import { LandingPage } from './components/LandingPage';
 import { Sidebar } from './components/Sidebar';
 import { JournalEditor } from './components/JournalEditor';
 import { GeminiConversation } from './components/GeminiConversation';
 import { GeminiSummarySection } from './components/GeminiSummarySection';
+import { InsightsView } from './components/InsightsView';
 import { DeleteModal } from './components/DeleteModal';
 import { BookOpen, Plus, Sparkles, Shield } from 'lucide-react';
 
@@ -45,6 +52,14 @@ export default function App() {
   // Summarizing state
   const [isSummarizing, setIsSummarizing] = useState(false);
 
+  // View state: 'journal' | 'insights'
+  const [currentView, setCurrentView] = useState<'journal' | 'insights'>('journal');
+
+  // AI Mood & Progress Insights state
+  const [insights, setInsights] = useState<UserInsight[]>([]);
+  const [isGeneratingInsights, setIsGeneratingInsights] = useState(false);
+  const [insightsError, setInsightsError] = useState<string | null>(null);
+
   // Delete modal state
   const [entryToDelete, setEntryToDelete] = useState<JournalEntry | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
@@ -66,6 +81,9 @@ export default function App() {
           setEntries([]);
           setActiveEntryId(null);
           setMessages([]);
+          setInsights([]);
+          setCurrentView('journal');
+          setInsightsError(null);
         }
         setAuthLoading(false);
       },
@@ -129,6 +147,26 @@ export default function App() {
     return () => unsubscribe();
   }, [currentUser, activeEntryId]);
 
+  // 4. Subscribe to user insights from Firestore when authenticated
+  useEffect(() => {
+    if (!currentUser) {
+      setInsights([]);
+      return;
+    }
+
+    const unsubscribe = subscribeToInsights(
+      currentUser.uid,
+      (updatedInsights) => {
+        setInsights(updatedInsights);
+      },
+      (err) => {
+        console.error('Firestore insights subscription error:', err);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [currentUser]);
+
   // Auth Handlers
   const handleSignIn = async () => {
     setAuthError(null);
@@ -160,8 +198,78 @@ export default function App() {
         tags: []
       });
       setActiveEntryId(newId);
+      setCurrentView('journal');
     } catch (err: any) {
       console.error('Create entry error:', err);
+    }
+  };
+
+  const handleGenerateInsights = async (forceRefreshInput?: boolean | unknown) => {
+    if (!currentUser) return;
+    if (entries.length === 0) {
+      setInsightsError('Please create at least one reflection entry before generating insights.');
+      return;
+    }
+
+    const forceRefresh = forceRefreshInput === true;
+    setIsGeneratingInsights(true);
+    setInsightsError(null);
+
+    try {
+      const latestInsight = insights[0] || null;
+      const response = await generateMoodAndProgressInsights(entries, {
+        forceRefresh,
+        currentFingerprint: latestInsight?.entryFingerprint,
+        cachedInsight: latestInsight ? {
+          entryCount: latestInsight.entryCount,
+          entryFingerprint: latestInsight.entryFingerprint,
+          dateRange: latestInsight.dateRange,
+          recurringThemes: latestInsight.recurringThemes,
+          moodAnalysis: latestInsight.moodAnalysis,
+          accomplishments: latestInsight.accomplishments,
+          challenges: latestInsight.challenges,
+          growthAreas: latestInsight.growthAreas,
+          reflectionPrompts: latestInsight.reflectionPrompts,
+          disclaimer: latestInsight.disclaimer
+        } : undefined
+      });
+
+      if (response && response.insights) {
+        if (!response.cached) {
+          const entryCountToSave = typeof response.entryCount === 'number' && response.entryCount > 0
+            ? response.entryCount
+            : (typeof response.insights.entryCount === 'number' && response.insights.entryCount > 0
+                ? response.insights.entryCount
+                : entries.length);
+
+          await saveUserInsight(currentUser.uid, {
+            ...response.insights,
+            entryCount: entryCountToSave,
+            entryFingerprint: response.entryFingerprint
+          });
+        }
+      }
+    } catch (err: any) {
+      console.error('Failed to generate insights:', err);
+      setInsightsError(err.message || 'Failed to synthesize mood & progress insights. Please try again.');
+    } finally {
+      setIsGeneratingInsights(false);
+    }
+  };
+
+  const handleStartReflectionWithPrompt = async (promptText: string) => {
+    if (!currentUser) return;
+    try {
+      const newId = await createJournalEntry(currentUser.uid, {
+        title: `Reflection: ${promptText.slice(0, 45)}${promptText.length > 45 ? '...' : ''}`,
+        content: `Prompt for reflection:\n"${promptText}"\n\n`,
+        mood: 'thoughtful',
+        tags: ['insight-reflection']
+      });
+      setActiveEntryId(newId);
+      setCurrentView('journal');
+    } catch (err) {
+      console.error('Failed to create entry from prompt:', err);
     }
   };
 
@@ -343,7 +451,12 @@ export default function App() {
   return (
     <div className="min-h-screen bg-stone-100 flex flex-col font-sans text-stone-900">
       {/* Top Navigation */}
-      <Navbar user={currentUser} onSignOut={handleSignOut} />
+      <Navbar
+        user={currentUser}
+        currentView={currentView}
+        onViewChange={(view) => setCurrentView(view)}
+        onSignOut={handleSignOut}
+      />
 
       {/* Main Container */}
       {authLoading ? (
@@ -365,15 +478,33 @@ export default function App() {
           <Sidebar
             entries={entries}
             activeEntryId={activeEntryId}
-            onSelectEntry={(id) => setActiveEntryId(id)}
+            currentView={currentView}
+            onSelectEntry={(id) => {
+              setActiveEntryId(id);
+              setCurrentView('journal');
+            }}
             onNewEntry={handleCreateNewEntry}
             onDeleteEntry={(id, e) => handleDeleteRequest(id, e)}
+            onOpenInsights={() => setCurrentView('insights')}
             isLoading={entriesLoading}
           />
 
-          {/* Main Reflection Workspace */}
+          {/* Main Reflection Workspace or Insights View */}
           <main className="flex-1 p-4 sm:p-6 lg:p-8 overflow-y-auto h-[calc(100vh-4rem)]">
-            {entriesLoading && entries.length === 0 ? (
+            {currentView === 'insights' ? (
+              <InsightsView
+                entries={entries}
+                latestInsight={insights[0] || null}
+                allInsights={insights}
+                isLoading={entriesLoading}
+                isGenerating={isGeneratingInsights}
+                error={insightsError}
+                onGenerateInsights={handleGenerateInsights}
+                onClearError={() => setInsightsError(null)}
+                onStartReflectionWithPrompt={handleStartReflectionWithPrompt}
+                onGoToJournal={handleCreateNewEntry}
+              />
+            ) : entriesLoading && entries.length === 0 ? (
               <div className="h-full flex items-center justify-center">
                 <div className="flex flex-col items-center gap-2">
                   <div className="w-6 h-6 border-2 border-stone-300 border-t-stone-800 rounded-full animate-spin" />

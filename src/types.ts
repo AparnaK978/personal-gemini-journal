@@ -46,3 +46,42 @@ export interface GeminiSummaryResponse {
   insights: string[];
   actionItems: string[];
 }
+
+export interface InsightTheme {
+  theme: string;
+  description: string;
+  occurrences?: number;
+}
+
+export interface MoodAnalysisData {
+  predominantMood: string;
+  emotionalTrajectory: string;
+  moodDistribution: Record<string, number>;
+  languageObservations: string[];
+}
+
+export interface UserInsight {
+  id: string;
+  userId: string;
+  entryFingerprint?: string;
+  generatedAt: any;
+  entryCount: number;
+  dateRange: {
+    from: string;
+    to: string;
+  };
+  recurringThemes: InsightTheme[];
+  moodAnalysis: MoodAnalysisData;
+  accomplishments: string[];
+  challenges: string[];
+  growthAreas: string[];
+  reflectionPrompts: string[];
+  disclaimer: string;
+}
+
+export interface InsightsResponse {
+  insights: Omit<UserInsight, 'id' | 'userId' | 'generatedAt'>;
+  entryCount: number;
+  cached?: boolean;
+  entryFingerprint?: string;
+}

@@ -1,5 +1,6 @@
 import express from 'express';
 import path from 'path';
+import crypto from 'crypto';
 import dotenv from 'dotenv';
 import { initializeApp, getApps, App } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
@@ -11,9 +12,10 @@ dotenv.config();
 const app = express();
 const PORT = 3000;
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'gen-lang-client-0499390612';
+const FIRESTORE_DATABASE_ID = process.env.FIRESTORE_DATABASE_ID || 'ai-studio-eb10963a-c673-4a7d-b383-bcb56fe0ac08';
 
-// Body parser with strict payload size limit (64kb to prevent denial of wallet/storage flooding)
-app.use(express.json({ limit: '64kb' }));
+// Body parser with payload size limit (256kb to support entry history summaries safely)
+app.use(express.json({ limit: '256kb' }));
 
 // In-memory per-user rate limiting (max 20 AI interactions per minute per user)
 const userRequestCounts = new Map<string, { count: number; resetTime: number }>();
@@ -421,6 +423,343 @@ ${conversationDigest || '(No extended dialogue)'}
     console.error('Summarize endpoint error:', error);
     return res.status(500).json({
       error: error?.message || 'An error occurred while generating the journal summary.'
+    });
+  }
+});
+
+// Helpers for Firestore REST API document parsing
+function parseFirestoreValue(val: any): any {
+  if (!val || typeof val !== 'object') return null;
+  if ('stringValue' in val) return val.stringValue;
+  if ('booleanValue' in val) return val.booleanValue;
+  if ('integerValue' in val) return parseInt(val.integerValue, 10);
+  if ('doubleValue' in val) return parseFloat(val.doubleValue);
+  if ('timestampValue' in val) return val.timestampValue;
+  if ('arrayValue' in val) {
+    return Array.isArray(val.arrayValue?.values)
+      ? val.arrayValue.values.map(parseFirestoreValue)
+      : [];
+  }
+  if ('mapValue' in val) {
+    const res: Record<string, any> = {};
+    const fields = val.mapValue?.fields || {};
+    for (const k of Object.keys(fields)) {
+      res[k] = parseFirestoreValue(fields[k]);
+    }
+    return res;
+  }
+  return null;
+}
+
+function parseFirestoreDocument(doc: any): any {
+  if (!doc) return null;
+  const id = doc.name ? doc.name.split('/').pop() : '';
+  const fields = doc.fields || {};
+  const data: Record<string, any> = { id };
+  for (const key of Object.keys(fields)) {
+    data[key] = parseFirestoreValue(fields[key]);
+  }
+  if (doc.createTime && !data.createdAt) data.createdAt = doc.createTime;
+  if (doc.updateTime && !data.updatedAt) data.updatedAt = doc.updateTime;
+  return data;
+}
+
+// Directly fetch user parent entries from Firestore REST API using the authenticated token
+async function fetchUserEntriesFromFirestore(userId: string, token: string): Promise<any[]> {
+  try {
+    const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/${FIRESTORE_DATABASE_ID}/documents/users/${userId}/entries?pageSize=30`;
+    const resp = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${token}`
+      }
+    });
+    if (!resp.ok) {
+      console.warn(`Firestore REST entries fetch returned HTTP ${resp.status}`);
+      return [];
+    }
+    const data = await resp.json();
+    if (!data.documents || !Array.isArray(data.documents)) {
+      return [];
+    }
+    return data.documents.map(parseFirestoreDocument).filter(Boolean);
+  } catch (err: any) {
+    console.error('Failed to fetch user entries from Firestore REST API:', err?.message || err);
+    return [];
+  }
+}
+
+// Fetch historical user insights to check for cached fingerprints
+async function fetchUserInsightsFromFirestore(userId: string, token: string): Promise<any[]> {
+  try {
+    const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/${FIRESTORE_DATABASE_ID}/documents/users/${userId}/insights?pageSize=10`;
+    const resp = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${token}`
+      }
+    });
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    if (!data.documents || !Array.isArray(data.documents)) return [];
+    return data.documents.map(parseFirestoreDocument).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+// Compute deterministic fingerprint based on entry IDs, timestamps, and recorded moods
+function computeEntryFingerprint(entries: any[]): string {
+  const sorted = [...entries].sort((a, b) => String(a.id || '').localeCompare(String(b.id || '')));
+  const signature = sorted
+    .map((e) => `${e.id}:${e.updatedAt || e.createdAt || ''}:${e.mood || ''}:${(e.content || '').length}`)
+    .join('|');
+  return crypto.createHash('sha256').update(signature).digest('hex').slice(0, 24);
+}
+
+// AI Mood & Progress Insights Endpoint
+app.post('/api/journal/insights', authenticateToken, async (req: express.Request, res: express.Response) => {
+  try {
+    const user = (req as any).user;
+    const userId = user.uid; // Cryptographically authenticated UID
+
+    if (!checkRateLimit(userId)) {
+      return res.status(429).json({
+        error: 'Rate limit exceeded. Please wait a moment before generating insights again.'
+      });
+    }
+
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+
+    const { forceRefresh = false, currentFingerprint: clientFingerprint, entries: clientEntries = [] } = req.body;
+
+    // 1. Fetch entries from Firestore REST API using the authenticated token
+    let fetchedEntries = await fetchUserEntriesFromFirestore(userId, token);
+
+    // If Firestore REST API call was not available, fall back to sanitized client-provided parent entries
+    const rawEntries = fetchedEntries.length > 0 ? fetchedEntries : clientEntries;
+
+    if (!Array.isArray(rawEntries) || rawEntries.length === 0) {
+      return res.status(400).json({
+        error: 'At least one journal entry is required to generate mood and progress insights.'
+      });
+    }
+
+    // Limit to the most recent 30 parent entries and strictly sanitize allowed fields (No messages!)
+    // Exclude empty drafts that have no written content and only a default/empty title
+    const validRawEntries = rawEntries.filter((entry: any) => {
+      if (!entry) return false;
+      const content = String(entry.content || '').trim();
+      const title = String(entry.title || '').trim();
+      const isDefaultTitle = !title || title.toLowerCase() === 'new reflection' || title.toLowerCase() === 'untitled';
+      return content.length > 0 || !isDefaultTitle;
+    });
+
+    const sanitizedEntries = validRawEntries.slice(0, 30).map((entry: any, index: number) => {
+      let dateStr = 'Recent';
+      if (entry.createdAt) {
+        try {
+          const d = new Date(entry.createdAt);
+          if (!isNaN(d.getTime())) {
+            dateStr = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+          }
+        } catch {
+          dateStr = 'Recent';
+        }
+      }
+
+      const rawMood = String(entry.mood || 'thoughtful').trim().toLowerCase();
+      const formattedMood = rawMood.charAt(0).toUpperCase() + rawMood.slice(1);
+
+      return {
+        index: index + 1,
+        id: String(entry.id || `entry-${index}`),
+        title: String(entry.title || 'Reflection').slice(0, 150),
+        mood: formattedMood,
+        tags: Array.isArray(entry.tags) ? entry.tags.map((t: any) => String(t).slice(0, 30)) : [],
+        content: String(entry.content || '').slice(0, 800), // Excerpt up to 800 chars
+        createdAt: entry.createdAt || null,
+        updatedAt: entry.updatedAt || null,
+        date: dateStr
+      };
+    });
+
+    if (sanitizedEntries.length === 0) {
+      return res.status(400).json({
+        error: 'At least one valid journal reflection is required to generate mood and progress insights.'
+      });
+    }
+
+    // 2. Compute deterministic fingerprint
+    const currentFingerprint = computeEntryFingerprint(sanitizedEntries);
+
+    // 3. Check for existing cached insight if forceRefresh is false
+    if (!forceRefresh) {
+      const existingInsights = await fetchUserInsightsFromFirestore(userId, token);
+      const matched = existingInsights.find((ins) => ins.entryFingerprint === currentFingerprint);
+      if (matched) {
+        const resolvedCount = matched.entryCount || sanitizedEntries.length;
+        return res.json({
+          cached: true,
+          entryFingerprint: currentFingerprint,
+          insights: {
+            ...matched,
+            entryCount: resolvedCount
+          },
+          entryCount: resolvedCount
+        });
+      }
+
+      if (clientFingerprint && clientFingerprint === currentFingerprint && req.body.cachedInsight) {
+        const resolvedCount = req.body.cachedInsight.entryCount || sanitizedEntries.length;
+        return res.json({
+          cached: true,
+          entryFingerprint: currentFingerprint,
+          insights: {
+            ...req.body.cachedInsight,
+            entryCount: resolvedCount
+          },
+          entryCount: resolvedCount
+        });
+      }
+    }
+
+    // 4. Calculate source date range consistently from the sanitized entries
+    const dates = sanitizedEntries
+      .map((e: any) => e.date)
+      .filter((d: string) => d && d !== 'Recent');
+    const fromDate = dates.length > 0 ? dates[dates.length - 1] : 'Recent';
+    const toDate = dates.length > 0 ? dates[0] : 'Today';
+
+    const isSingleEntry = sanitizedEntries.length === 1;
+
+    const systemInstruction = `You are a supportive, objective, and empathetic AI Cognitive Reflection Guide analyzing a user's personal journal history.
+Your purpose is to help the user reflect on patterns, recurring themes, emotional language shifts, personal accomplishments, persistent challenges, and potential areas of growth.
+
+CRITICAL PRIVACY & SAFETY DIRECTIVES:
+- BASE EVERY OBSERVATION STRICTLY on the user's provided journal entries. Never fabricate entries, moods, or fictional events.
+- NON-DIAGNOSTIC MANDATE: Present insights strictly as reflective observations and supportive inquiries, NEVER as clinical psychological assessment, psychiatric evaluation, or medical diagnosis.
+- Avoid definitive diagnostic claims (e.g., NEVER say "You suffer from clinical depression", "You have anxiety disorder", or "You are experiencing trauma").
+- Use gentle, observational framing (e.g., "Your entries suggest...", "You frequently reflected on...", "You noted feeling...", "A noticeable theme in your recent reflections is...").
+${isSingleEntry ? `
+SINGLE ENTRY DIRECTIVE:
+- The user has provided only 1 journal entry.
+- DO NOT claim, infer, or extrapolate long-term emotional trajectories, multi-day trends, or historical evolution.
+- State clearly that observations reflect only this single entry snapshot.
+- Emphasize that additional reflections over time will illuminate longer-term patterns and growth.
+` : `
+- If the journal history is brief (e.g. 2-3 entries), focus on the immediate themes observed while gently noting that additional entries will unveil deeper long-term trajectories.
+`}
+
+Return ONLY valid JSON matching this schema:
+{
+  "recurringThemes": [
+    {
+      "theme": "Concise theme name (e.g., Creative Momentum, Work-Life Boundaries, Daily Gratitude)",
+      "description": "2-3 sentences explaining how this theme emerged across the reflections.",
+      "occurrences": 3
+    }
+  ],
+  "moodAnalysis": {
+    "predominantMood": "One or two words capturing the primary emotional baseline (e.g., Thoughtful & Grounded)",
+    "emotionalTrajectory": "A thoughtful 2-3 sentence overview describing how the user's emotional tone and perspective shifted or held steady across the analyzed timeframe.",
+    "languageObservations": [
+      "2 to 3 observations on specific linguistic patterns, self-talk tone, or emotional metaphors used in the writing."
+    ]
+  },
+  "accomplishments": [
+    "2 to 4 concrete milestones, internal wins, creative progress, or mindset breakthroughs documented in the entries."
+  ],
+  "challenges": [
+    "2 to 3 common hurdles, moments of self-doubt, or friction points the user reflected on."
+  ],
+  "growthAreas": [
+    "2 to 3 constructive, gentle opportunities for growth or intentional habits."
+  ],
+  "reflectionPrompts": [
+    "3 to 4 actionable, open-ended reflection prompts or inquiries for upcoming journal sessions."
+  ],
+  "disclaimer": "These insights are reflective AI-generated observations based on your personal journal entries. They are intended for self-discovery and do not constitute medical, psychological, or psychiatric diagnosis or therapy."
+}`;
+
+    // Format entries into XML delimiter boundaries to prevent prompt injection
+    const formattedEntriesXml = sanitizedEntries
+      .map(
+        (e: any) =>
+          `<journal_entry index="${e.index}" date="${e.date}" mood="${e.mood}" tags="${e.tags.join(', ')}">\n<title>${e.title}</title>\n<excerpt>${e.content || '(No additional text)'}</excerpt>\n</journal_entry>`
+      )
+      .join('\n\n');
+
+    const promptText = `Please synthesize mood and progress insights for the following ${sanitizedEntries.length} journal reflection${sanitizedEntries.length === 1 ? '' : 's'}:
+
+<user_journal_history total_entries="${sanitizedEntries.length}" date_range="${fromDate} to ${toDate}">
+${formattedEntriesXml}
+</user_journal_history>`;
+
+    const contents = [{
+      role: 'user',
+      parts: [{ text: promptText }]
+    }];
+
+    const rawJson = await callGeminiWithResilience(contents, systemInstruction, 'application/json');
+    let parsedData: any;
+    try {
+      parsedData = JSON.parse(rawJson);
+    } catch {
+      const cleaned = rawJson.replace(/```json/g, '').replace(/```/g, '').trim();
+      try {
+        parsedData = JSON.parse(cleaned);
+      } catch {
+        // Strict Requirement 6: Do not invent observations if Gemini returns malformed data
+        return res.status(502).json({
+          error: 'Unable to safely parse reflection synthesis from AI service. Your previous journal entries and insights remain intact. Please try again.'
+        });
+      }
+    }
+
+    // Tally actual mathematical mood distribution directly from user entries (Zero hallucination)
+    const calculatedDistribution: Record<string, number> = {};
+    for (const e of sanitizedEntries) {
+      const m = e.mood.toLowerCase();
+      calculatedDistribution[m] = (calculatedDistribution[m] || 0) + 1;
+    }
+
+    const defaultTrajectory = isSingleEntry
+      ? 'Observations reflect your single journal reflection snapshot. Additional reflections over time will help uncover longer-term patterns.'
+      : 'Your reflections demonstrate an ongoing commitment to personal awareness.';
+
+    const normalizedInsights = {
+      entryCount: sanitizedEntries.length,
+      entryFingerprint: currentFingerprint,
+      dateRange: {
+        from: fromDate,
+        to: toDate
+      },
+      recurringThemes: Array.isArray(parsedData.recurringThemes) ? parsedData.recurringThemes : [],
+      moodAnalysis: {
+        predominantMood: parsedData.moodAnalysis?.predominantMood || sanitizedEntries[0]?.mood || 'Reflective',
+        emotionalTrajectory: parsedData.moodAnalysis?.emotionalTrajectory || defaultTrajectory,
+        moodDistribution: calculatedDistribution,
+        languageObservations: Array.isArray(parsedData.moodAnalysis?.languageObservations)
+          ? parsedData.moodAnalysis.languageObservations
+          : []
+      },
+      accomplishments: Array.isArray(parsedData.accomplishments) ? parsedData.accomplishments : [],
+      challenges: Array.isArray(parsedData.challenges) ? parsedData.challenges : [],
+      growthAreas: Array.isArray(parsedData.growthAreas) ? parsedData.growthAreas : [],
+      reflectionPrompts: Array.isArray(parsedData.reflectionPrompts) ? parsedData.reflectionPrompts : [],
+      disclaimer: 'These insights are reflective AI-generated observations based on your personal journal entries. They are intended for self-discovery and do not constitute medical, psychological, or psychiatric diagnosis or therapy.'
+    };
+
+    return res.json({
+      cached: false,
+      entryFingerprint: currentFingerprint,
+      insights: normalizedInsights,
+      entryCount: sanitizedEntries.length
+    });
+  } catch (error: any) {
+    console.error('Insights endpoint error:', error);
+    return res.status(500).json({
+      error: error?.message || 'An error occurred while generating mood and progress insights.'
     });
   }
 });

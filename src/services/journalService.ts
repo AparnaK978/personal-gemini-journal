@@ -13,7 +13,7 @@ import {
   increment
 } from 'firebase/firestore';
 import { db } from '../lib/firebase';
-import { JournalEntry, JournalMessage } from '../types';
+import { JournalEntry, JournalMessage, UserInsight } from '../types';
 
 /**
  * Determines whether a value is a Firestore sentinel object (FieldValue or Timestamp)
@@ -447,3 +447,117 @@ export async function clearJournalMessages(
     }).catch(() => {});
   }
 }
+
+/**
+ * Real-time subscription to user's AI Mood & Progress Insights
+ */
+export function subscribeToInsights(
+  userId: string,
+  onUpdate: (insights: UserInsight[]) => void,
+  onError?: (error: Error) => void
+): () => void {
+  const insightsRef = collection(db, 'users', userId, 'insights');
+  const q = query(insightsRef, orderBy('generatedAt', 'desc'));
+
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const insights: UserInsight[] = snapshot.docs.map((docSnap) => {
+        const data = docSnap.data();
+        const moodDist = (data.moodAnalysis?.moodDistribution || {}) as Record<string, any>;
+        let moodDistSum = 0;
+        for (const count of Object.values(moodDist)) {
+          if (typeof count === 'number') moodDistSum += count;
+        }
+        const resolvedEntryCount = typeof data.entryCount === 'number' && data.entryCount > 0
+          ? Number(data.entryCount)
+          : (moodDistSum > 0 ? moodDistSum : 0);
+
+        return {
+          id: docSnap.id,
+          userId: data.userId || userId,
+          entryFingerprint: data.entryFingerprint || undefined,
+          entryCount: resolvedEntryCount,
+          dateRange: data.dateRange || { from: 'Recent', to: 'Today' },
+          recurringThemes: data.recurringThemes || [],
+          moodAnalysis: data.moodAnalysis || {
+            predominantMood: 'Thoughtful',
+            emotionalTrajectory: '',
+            moodDistribution: {},
+            languageObservations: []
+          },
+          accomplishments: data.accomplishments || [],
+          challenges: data.challenges || [],
+          growthAreas: data.growthAreas || [],
+          reflectionPrompts: data.reflectionPrompts || [],
+          disclaimer: data.disclaimer || 'These insights are reflective AI-generated observations based on your personal journal entries.',
+          generatedAt: data.generatedAt?.toDate ? data.generatedAt.toDate() : new Date()
+        };
+      });
+
+      // Deterministic sort with ID collision tie-breaker
+      insights.sort((a, b) => {
+        const timeA = a.generatedAt instanceof Date ? a.generatedAt.getTime() : 0;
+        const timeB = b.generatedAt instanceof Date ? b.generatedAt.getTime() : 0;
+        if (timeB !== timeA) return timeB - timeA;
+        return b.id.localeCompare(a.id);
+      });
+
+      onUpdate(insights);
+    },
+    (err) => {
+      console.error('Failed to subscribe to insights:', err);
+      if (onError) onError(err);
+    }
+  );
+}
+
+/**
+ * Persist newly generated AI insights for the authenticated user
+ */
+export async function saveUserInsight(
+  userId: string,
+  insightData: Omit<UserInsight, 'id' | 'userId' | 'generatedAt'>
+): Promise<string> {
+  const insightsCol = collection(db, 'users', userId, 'insights');
+  const newDocRef = doc(insightsCol);
+
+  const moodDist = (insightData.moodAnalysis?.moodDistribution || {}) as Record<string, any>;
+  let moodDistSum = 0;
+  for (const count of Object.values(moodDist)) {
+    if (typeof count === 'number') moodDistSum += count;
+  }
+  const resolvedCount = typeof insightData.entryCount === 'number' && insightData.entryCount > 0
+    ? Number(insightData.entryCount)
+    : (moodDistSum > 0 ? moodDistSum : 0);
+
+  const payload = sanitizePayload({
+    userId,
+    entryFingerprint: insightData.entryFingerprint || null,
+    entryCount: resolvedCount,
+    dateRange: insightData.dateRange,
+    recurringThemes: insightData.recurringThemes,
+    moodAnalysis: insightData.moodAnalysis,
+    accomplishments: insightData.accomplishments,
+    challenges: insightData.challenges,
+    growthAreas: insightData.growthAreas,
+    reflectionPrompts: insightData.reflectionPrompts,
+    disclaimer: insightData.disclaimer,
+    generatedAt: serverTimestamp()
+  });
+
+  await setDoc(newDocRef, payload);
+  return newDocRef.id;
+}
+
+/**
+ * Delete a specific insight record
+ */
+export async function deleteUserInsight(
+  userId: string,
+  insightId: string
+): Promise<void> {
+  const docRef = doc(db, 'users', userId, 'insights', insightId);
+  await deleteDoc(docRef);
+}
+

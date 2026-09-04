@@ -40,6 +40,24 @@
         "turnIndex": { "type": "number" },
         "createdAt": { "type": "timestamp" }
       }
+    },
+    "UserInsight": {
+      "collection": "users/{userId}/insights",
+      "fields": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "entryFingerprint": { "type": "string" },
+        "entryCount": { "type": "number" },
+        "dateRange": { "type": "object" },
+        "recurringThemes": { "type": "array" },
+        "moodAnalysis": { "type": "object" },
+        "accomplishments": { "type": "array" },
+        "challenges": { "type": "array" },
+        "growthAreas": { "type": "array" },
+        "reflectionPrompts": { "type": "array" },
+        "disclaimer": { "type": "string" },
+        "generatedAt": { "type": "timestamp" }
+      }
     }
   }
 }

@@ -1,13 +1,15 @@
 import React, { useState } from 'react';
-import { Plus, Search, Trash2, Calendar, MessageSquare, Tag, Filter } from 'lucide-react';
+import { Plus, Search, Trash2, Calendar, MessageSquare, Tag, Filter, Sparkles, ArrowRight } from 'lucide-react';
 import { JournalEntry, JournalMood } from '../types';
 
 interface SidebarProps {
   entries: JournalEntry[];
   activeEntryId: string | null;
+  currentView?: 'journal' | 'insights';
   onSelectEntry: (id: string) => void;
   onNewEntry: () => void;
   onDeleteEntry: (id: string, e: React.MouseEvent) => void;
+  onOpenInsights?: () => void;
   isLoading: boolean;
 }
 
@@ -24,9 +26,11 @@ const MOOD_OPTIONS: { value: JournalMood | 'all'; label: string; dotColor: strin
 export const Sidebar: React.FC<SidebarProps> = ({
   entries,
   activeEntryId,
+  currentView = 'journal',
   onSelectEntry,
   onNewEntry,
   onDeleteEntry,
+  onOpenInsights,
   isLoading
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
@@ -83,6 +87,24 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <Plus className="w-4 h-4" />
           <span>New Journal Reflection</span>
         </button>
+
+        {/* AI Mood & Progress Insights Navigation Button */}
+        {onOpenInsights && (
+          <button
+            onClick={onOpenInsights}
+            className={`w-full flex items-center justify-between p-2.5 rounded-xl border text-xs font-semibold transition-all cursor-pointer ${
+              currentView === 'insights'
+                ? 'bg-amber-50 text-amber-950 border-amber-300 shadow-2xs'
+                : 'bg-stone-50 hover:bg-stone-100 text-stone-700 border-stone-200/80'
+            }`}
+          >
+            <div className="flex items-center gap-2">
+              <Sparkles className={`w-3.5 h-3.5 ${currentView === 'insights' ? 'text-amber-600' : 'text-stone-500'}`} />
+              <span>Mood & Progress Insights</span>
+            </div>
+            <ArrowRight className="w-3.5 h-3.5 text-stone-400" />
+          </button>
+        )}
 
         {/* Search Bar */}
         <div className="relative">
