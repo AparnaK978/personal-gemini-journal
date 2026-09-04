@@ -1,0 +1,48 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // Default deny all access
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // User profile document
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId)
+                    && request.resource.data.id == userId;
+      allow update: if isOwner(userId)
+                    && request.resource.data.id == userId;
+      allow delete: if isOwner(userId);
+
+      // Journal entries subcollection
+      match /entries/{entryId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId)
+                      && request.resource.data.userId == userId;
+        allow update: if isOwner(userId)
+                      && request.resource.data.userId == resource.data.userId;
+        allow delete: if isOwner(userId);
+
+        // Multi-turn messages subcollection
+        match /messages/{messageId} {
+          allow read: if isOwner(userId);
+          allow create: if isOwner(userId)
+                        && request.resource.data.userId == userId;
+          allow update: if isOwner(userId)
+                        && request.resource.data.userId == resource.data.userId;
+          allow delete: if isOwner(userId);
+        }
+      }
+    }
+  }
+}
